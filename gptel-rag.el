@@ -1,4 +1,4 @@
-;;; gptel-rag --- Augment Contexts for GPTel     -*- lexical-binding: t; -*-
+;;; gptel-rag --- Retrieval-Augmented Generation for GPTel -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025 John Wiegley
 
@@ -32,150 +32,102 @@
 
 (require 'cl-lib)
 (require 'cl-macs)
-(eval-when-compile
-  (require 'cl))
-
+(require 'seq)
 (require 'gptel)
 
 (defcustom gptel-rag-client-exe "rag-client"
   "Name or path of the rag-client executable."
   :type 'file)
 
-(defcustom gptel-rag-embed-provider "HuggingFace"
-  "Provider to use for text embeddings.
-TODO: In future, allow models from different providers, such as OpenAI."
-  :type 'string)
+(defcustom gptel-rag-config-file "config.yaml"
+  "Config file used to configure rag-client for `gptel-rag'."
+  :type 'file)
 
-(defcustom gptel-rag-embed-model "BAAI/bge-large-en-v1.5"
-  "Model to use for text embeddings.
-TODO: In future, allow models from different providers, such as OpenAI."
-  :type 'string)
+(defcustom gptel-rag-files-and-directories nil
+  "List of files and directories to use for RAG searches.
+This should be set buffer-local to have custom file sets per chat
+buffer."
+  :type '(repeat (choice file directory)))
 
-(defcustom gptel-rag-content-limit 32768
-  "Maximum size in bytes that can be used for file content."
-  :type 'integer)
-
-(defcustom gptel-rag-embed-dim 1024
-  "Vector dimensions used by `gptel-rag-embed-model'. Must match!"
-  :type 'integer)
-
-(defcustom gptel-rag-chunk-size 512
-  "Size of textual chunks when splitting documents."
-  :type 'integer)
-
-(defcustom gptel-rag-chunk-overlap 16
-  "Amount of overlap between chunks when splitting documents."
-  :type 'integer)
-
-(defcustom gptel-rag-top-k 10
+(defcustom gptel-rag-top-k 3
   "Return the top K document nodes when querying a collection."
   :type 'integer)
 
-(defun gptel-rag-to-file (entry)
-  "Convert ENTRY to a file pathname.
-This argument is accepted in one of two forms:
+(defun gptel-rag--search (config-path query-string callback-fn
+                                      &rest files-or-directories)
+  "Given a rag-client CONFIG-PATH anda QUERY-STRING, find similar documents.
+The set of documents to be search is given by FILES-OR-DIRECTORIES.
 
-1. It is a singleton list of the form (filename)
-2. It is a cons cell of the form (buffer . (overlay1 overlay2 ...))"
-  (car entry))
+This function is asynchronous, and will call CALLBACK-FN with a list of
+results of the following type:
 
-(defun gptel-rag--collection-size (collection)
-  (if (listp collection)
-      (apply #'+ (mapcar #'(lambda (entry)
-                             (file-attribute-size (file-attributes entry)))
-                         collection))
-    0))
+  [((text . STRING)
+    (metadata ((file_path . PATH)
+               (file_name . STRING)
+               (file_type . STRING)
+               (file_size . INT)
+               (creation_date . DATE)
+               (last_modified_date . DATE)))
+   ...
+  ]"
+  (unless (file-readable-p config-path)
+    (error "Invalid config path passed to `gptel-rag-search'"))
+  (let ((proc
+         (make-process
+          :name "*rag-client*"
+          :buffer "*rag-client-output*"
+          :command
+          (list (executable-find gptel-rag-client-exe)
+                "--config" (expand-file-name config-path)
+                "--top-k" (number-to-string gptel-rag-top-k)
+                "--from" "-"
+                "search" query-string)
+          :connection-type 'pipe
+          :sentinel
+          #'(lambda (proc _event)
+              (unless (process-live-p proc)
+                (with-current-buffer (process-buffer proc)
+                  (goto-char (point-max))
+                  (backward-sexp)
+                  (funcall callback-fn (seq--into-list (json-read)))))))))
+    (process-send-string
+     proc
+     (with-temp-buffer
+       (dolist (path
+                (cl-mapcan
+                 #'(lambda (path)
+                     (if (file-directory-p path)
+                         (cl-mapcar #'(lambda (file)
+                                        (expand-file-name file path))
+                                    (cl-set-difference
+                                     (directory-files path)
+                                     '("." "..")
+                                     :test #'string=))
+                       (list (expand-file-name path))))
+                 files-or-directories))
+         (insert path ?\n))
+       (buffer-string)))
+    (process-send-eof proc)))
 
-(defun gptel-rag--call-rag-client (callback fsm collection query)
-  (with-temp-buffer
-    (dolist (entry collection)
-      (insert (expand-file-name entry) ?\n))
-    (message "Indexing and querying document collection...")
-    (let ((proc
-           (make-process
-            :name "*rag-client*"
-            :buffer "*rag-client-output*"
-            :command
-            (list (executable-find gptel-rag-client-exe)
-                  "--embed-model" gptel-rag-embed-model
-                  "--embed-dim" gptel-rag-embed-dim
-                  "--chunk-size" gptel-rag-chunk-size
-                  "--chunk-overlap" gptel-rag-chunk-overlap
-                  "--top-k" (number-to-string gptel-rag-top-k)
-                  "--from" "-"
-                  "search" query)
-            :connection-type 'pipe
-            :sentinel
-            #'(lambda (proc event)
-                (unless (process-live-p proc)
-                  (with-current-buffer (process-buffer proc)
-                    (goto-char (point-min))
-                    (funcall
-                     callback
-                     (mapcar
-                      #'(lambda (result)
-                          (cons (alist-get 'file_name
-                                           (alist-get 'metadata result))
-                                (alist-get 'text result)))
-                      (json-read)))))))))
-      (process-send-string proc (buffer-string))
-      (process-send-eof proc)
-      (setf (alist-get proc gptel--request-alist)
-            (cons fsm
-                  #'(lambda ()
-                      (set-process-sentinel proc #'ignore)
-                      (delete-process proc)
-                      (sleep-for 0 100)
-                      (kill-buffer (process-buffer proc))))))))
-
-(defun gptel-rag--get-user-messages (messages)
-  "Return a list of strings representing all user messages in INFO."
-  (cl-loop for msg in messages
-           if (string= (plist-get msg :role) "user")
-           collect (plist-get msg :content)))
-
-(defun gptel-rag-last-user-message (info)
-  "Return the last user message found in a set of query messages."
-  (car
-   (last
-    (gptel-rag--get-user-messages
-     (plist-get (plist-get info :data) :full-prompt)))))
-
-(defun gptel-rag--append-system-message (data message)
-  "Format a string message as a system message.
-The exact representation may different depending on the backend."
-  (plist-put data :full-prompt
-             (append (plist-get data :full-prompt)
-                     `((:role "system" :content ,message)))))
-
-(defsubst gptel-rag-add-system-message (info message)
-  "Add MESSAGE to the set of query messages."
-  (gptel-rag--append-system-message (plist-get info :data) message))
-
-(defun gptel-rag (callback fsm)
-  (let* ((info (gptel-fsm-info fsm))
-         (paths (mapcar #'gptel-rag-to-file
-                        (plist-get (plist-get info :data) :collection))))
-    ;; jww (2025-05-16): Instead of passing a :collection keyword in the info
-    ;; plist, I could just call `gptel-context--collect' here.
-    (if (> (gptel-rag--collection-size paths) gptel-rag-content-limit)
-        (progn
-          (plist-put (plist-get info :data) :collection nil)
-          (gptel-rag--call-rag-client
-           #'(lambda (nodes)
-               (dolist (node nodes)
-                 (gptel-rag-add-system-message
-                  info
-                  (with-temp-buffer
-                    (insert "In file `" (car node) "` (citation):\n\n```"
-                            (cdr node)
-                            "\n```\n")
-                    (buffer-string))))
-               (funcall callback info))
-           fsm paths (gptel-rag-last-user-message info)))
-      (funcall callback fsm))))
-
-(defun gptel-rag-install ()
-  (add-hook 'gptel-rag-handler-functions #'gptel-rag))
+(defun gptel-rag-transform (callback _info)
+  "A prompt transformation function that augment the prompt using RAG.
+The CALLBACK is called with the result when ready."
+  (let ((buffer (current-buffer)))
+    (apply
+     #'gptel-rag--search
+     gptel-rag-config-file
+     (buffer-string)
+     #'(lambda (results)
+         (with-current-buffer buffer
+           (insert "\n\n")
+           (dolist (result results)
+             (insert (format "With context from file '%s':\n\n%s\n\n"
+                             (alist-get 'file_name
+                                        (alist-get 'metadata result))
+                             (alist-get 'text result)))))
+         (funcall callback))
+     gptel-rag-files-and-directories)))
 
 (provide 'gptel-rag)
+
+;;; gptel-rag.el ends here
