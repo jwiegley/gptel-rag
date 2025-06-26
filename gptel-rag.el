@@ -24,11 +24,22 @@
 ;; Boston, MA 02111-1307, USA.
 
 ;;; Commentary:
+
+;; This package integrates Retrieval-Augmented Generation (RAG) capabilities
+;; with GPTel. It provides a backend for searching contextual documents using
+;; an external rag-client binary and a prompt transformation function to
+;; inject retrieved context into LLM prompts.
 ;;
-;; A "augment context" is context that is added to a query based on
-;; information determined at the time of submission. This information can come
-;; from anywhere, and must simply result in text to be appended to the either
-;; the system or user context of the query.
+;; Main components:
+;; - Asynchronous rag-client integration using JSON output format
+;; - Buffer-local document path customization
+;; - Prompt augmentation with ranked document contexts
+;;
+;; To use: Set `gptel-rag-files-and-directories' in your chat buffer, then
+;; call `gptel-rag-transform' as a prompt transformation function during GPTel
+;; sessions.
+
+;;; Code:
 
 (require 'cl-lib)
 (require 'cl-macs)
@@ -53,12 +64,17 @@ buffer."
   "Return the top K document nodes when querying a collection."
   :type 'integer)
 
-(defun gptel-rag--search (config-path query-string callback-fn
-                                      &rest files-or-directories)
-  "Given a rag-client CONFIG-PATH anda QUERY-STRING, find similar documents.
-The set of documents to be search is given by FILES-OR-DIRECTORIES.
+(cl-defun gptel-rag--search (query
+                             &key
+                             (config gptel-rag-config-file)
+                             (top-k gptel-rag-top-k)
+                             paths
+                             callback)
+  "Given a rag-client CONFIG anda QUERY, find similar documents.
+The set of documents to be search is given by PATHS, with the maximum
+number of such documents indicated by TOP-K.
 
-This function is asynchronous, and will call CALLBACK-FN with a list of
+This function is asynchronous, and will call CALLBACK with a list of
 results of the following type:
 
   [((text . STRING)
@@ -70,7 +86,7 @@ results of the following type:
                (last_modified_date . DATE)))
    ...
   ]"
-  (unless (file-readable-p config-path)
+  (unless (file-readable-p config)
     (error "Invalid config path passed to `gptel-rag-search'"))
   (let ((proc
          (make-process
@@ -78,10 +94,10 @@ results of the following type:
           :buffer "*rag-client-output*"
           :command
           (list (executable-find gptel-rag-client-exe)
-                "--config" (expand-file-name config-path)
-                "--top-k" (number-to-string gptel-rag-top-k)
+                "--config" (expand-file-name config)
+                "--top-k" (number-to-string top-k)
                 "--from" "-"
-                "search" query-string)
+                "search" query)
           :connection-type 'pipe
           :sentinel
           #'(lambda (proc _event)
@@ -89,44 +105,39 @@ results of the following type:
                 (with-current-buffer (process-buffer proc)
                   (goto-char (point-max))
                   (backward-sexp)
-                  (funcall callback-fn (seq--into-list (json-read)))))))))
+                  (funcall callback (seq--into-list (json-read)))))))))
     (process-send-string
      proc
      (with-temp-buffer
-       (dolist (path
-                (cl-mapcan
-                 #'(lambda (path)
-                     (if (file-directory-p path)
-                         (cl-mapcar #'(lambda (file)
-                                        (expand-file-name file path))
-                                    (cl-set-difference
-                                     (directory-files path)
-                                     '("." "..")
-                                     :test #'string=))
-                       (list (expand-file-name path))))
-                 files-or-directories))
+       (dolist (path (mapcar #'expand-file-name paths))
          (insert path ?\n))
        (buffer-string)))
     (process-send-eof proc)))
 
-(defun gptel-rag-transform (callback _info)
+(defun gptel-rag-transform (callback fsm)
   "A prompt transformation function that augment the prompt using RAG.
-The CALLBACK is called with the result when ready."
-  (let ((buffer (current-buffer)))
-    (apply
-     #'gptel-rag--search
-     gptel-rag-config-file
-     (buffer-string)
-     #'(lambda (results)
-         (with-current-buffer buffer
-           (insert "\n\n")
-           (dolist (result results)
-             (insert (format "With context from file '%s':\n\n%s\n\n"
-                             (alist-get 'file_name
-                                        (alist-get 'metadata result))
-                             (alist-get 'text result)))))
-         (funcall callback))
-     gptel-rag-files-and-directories)))
+The CALLBACK is called with the result when ready, and FSM gives the
+finite state machine object."
+  (let ((info-buf (plist-get (gptel-fsm-info fsm) :buffer)))
+    (cl-macrolet ((chat-sym (sym)
+                    `(with-current-buffer info-buf ,sym)))
+      (let ((buffer (current-buffer)))
+        (gptel-rag--search
+         (buffer-string)
+         :config (chat-sym gptel-rag-config-file)
+         :top-k (chat-sym gptel-rag-top-k)
+         :paths (chat-sym gptel-rag-files-and-directories)
+         :callback
+         #'(lambda (results)
+             (with-current-buffer buffer
+               (goto-char (point-max))
+               (insert "\n\n")
+               (dolist (result results)
+                 (insert (format "With context from file '%s':\n\n%s\n\n"
+                                 (alist-get 'file_name
+                                            (alist-get 'metadata result))
+                                 (alist-get 'text result)))))
+             (funcall callback)))))))
 
 (provide 'gptel-rag)
 
